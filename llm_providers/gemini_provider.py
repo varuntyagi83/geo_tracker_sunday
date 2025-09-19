@@ -1,21 +1,59 @@
-import time, re
+import time, re, urllib.parse, sys
 from typing import Dict, Any, Optional, List
 
 import google.generativeai as genai
 from config import GOOGLE_API_KEY, GEMINI_DEFAULT_MODEL
 from .base import LLMProvider
 
-URL_RE = re.compile(r"https?://[^\s)\]]+")
+# Regexes
+URL_RE = re.compile(r'\bhttps?://[^\s\)\]]+', re.IGNORECASE)
+MD_LINK_RE = re.compile(r'\[([^\]]{0,200})\]\((https?://[^\s\)]+)\)')
+
+def _norm_url_key(url: str):
+    try:
+        p = urllib.parse.urlparse(url)
+        host = (p.netloc or "").lower()
+        if host.startswith("www."):
+            host = host[4:]
+        path = p.path or "/"
+        return (host, path)
+    except Exception:
+        return (url, "")
 
 def _dedupe_sources(sources: List[dict]) -> List[dict]:
     seen = set()
     out = []
     for s in sources:
         url = (s.get("url") or "").strip()
-        if url and url not in seen:
-            out.append({"url": url, "title": s.get("title")})
-            seen.add(url)
+        if not url:
+            continue
+        key = _norm_url_key(url)
+        if key in seen:
+            continue
+        seen.add(key)
+        title = (s.get("title") or "").strip() or None
+        out.append({"url": url, "title": title})
     return out
+
+def _extract_sources_from_text(text: str) -> List[dict]:
+    if not text:
+        return []
+    found: List[dict] = []
+
+    # Markdown links first to capture titles
+    for m in MD_LINK_RE.finditer(text):
+        title = (m.group(1) or "").strip() or None
+        url = m.group(2).strip()
+        found.append({"url": url, "title": title})
+
+    # Bare URLs
+    seen_urls = {f["url"] for f in found}
+    for m in URL_RE.finditer(text):
+        url = m.group(0).strip().rstrip(").,;")
+        if url not in seen_urls:
+            found.append({"url": url, "title": None})
+
+    return _dedupe_sources(found)
 
 class GeminiProvider(LLMProvider):
     name = "gemini"
@@ -23,8 +61,9 @@ class GeminiProvider(LLMProvider):
     def __init__(self):
         if not GOOGLE_API_KEY:
             raise ValueError("GOOGLE_API_KEY not set")
-        # Keep configuration minimal to avoid any side effects
         genai.configure(api_key=GOOGLE_API_KEY)
+
+    # ---------------- helpers ----------------
 
     def _extract_text(self, resp) -> str:
         try:
@@ -47,33 +86,75 @@ class GeminiProvider(LLMProvider):
             pass
         return tokens_in, tokens_out
 
+    def _extract_any_citations(self, resp_dict: dict) -> List[dict]:
+        """
+        Robust citation/grounding extraction across Gemini 1.5 shapes.
+        """
+        found: List[dict] = []
+        cands = (resp_dict or {}).get("candidates") or []
+        for c in cands:
+            # 1) groundingMetadata (chunks, citations, attributions)
+            gm = c.get("groundingMetadata") or {}
+            for ch in gm.get("groundingChunks", []) or []:
+                web = ch.get("web") or {}
+                url = web.get("uri") or web.get("url")
+                title = web.get("title")
+                if url:
+                    found.append({"url": url, "title": title})
+            for src in gm.get("citations", []) or []:
+                url = src.get("uri") or src.get("url")
+                title = src.get("title")
+                if url:
+                    found.append({"url": url, "title": title})
+            for att in gm.get("groundingAttributions", []) or []:
+                url = att.get("sourceUrl") or att.get("url") or att.get("uri")
+                title = att.get("title")
+                if url:
+                    found.append({"url": url, "title": title})
+
+            # 2) citationMetadata attached to content.parts
+            content = c.get("content") or {}
+            for part in (content.get("parts") or []):
+                cm = part.get("citationMetadata") or {}
+                for cs in cm.get("citationSources", []) or []:
+                    url = cs.get("uri") or cs.get("url")
+                    title = cs.get("title")
+                    if url:
+                        found.append({"url": url, "title": title})
+
+            # 3) top-level candidate citationMetadata (seen in some variants)
+            cm2 = c.get("citationMetadata") or {}
+            for cs in cm2.get("citationSources", []) or []:
+                url = cs.get("uri") or cs.get("url")
+                title = cs.get("title")
+                if url:
+                    found.append({"url": url, "title": title})
+
+        return _dedupe_sources(found)
+
     def _extract_grounded_sources(self, resp, fallback_text: str) -> List[dict]:
+        """
+        Prefer grounded/citation metadata; fallback to URLs in text.
+        """
         sources: List[dict] = []
         try:
             data = resp.to_dict() if hasattr(resp, "to_dict") else None
             if data:
-                cands = data.get("candidates") or []
-                for c in cands:
-                    gm = c.get("groundingMetadata") or {}
-                    for ch in gm.get("groundingChunks", []):
-                        web = ch.get("web") or {}
-                        url = web.get("uri") or web.get("url")
-                        title = web.get("title")
-                        if url:
-                            sources.append({"url": url, "title": title})
-                    for src in gm.get("citations", []):
-                        url = src.get("uri") or src.get("url")
-                        title = src.get("title")
-                        if url:
-                            sources.append({"url": url, "title": title})
+                sources = self._extract_any_citations(data)
         except Exception:
             pass
+
         if not sources and fallback_text:
-            for m in URL_RE.finditer(fallback_text):
-                sources.append({"url": m.group(0)})
+            sources = _extract_sources_from_text(fallback_text)
+
         return _dedupe_sources(sources)
 
+    # ---------------- public API ----------------
+
     def generate(self, prompt: str, model: Optional[str] = None) -> Dict[str, Any]:
+        """
+        INTERNAL mode (no live web). We still parse any links in the text for parity.
+        """
         model = model or GEMINI_DEFAULT_MODEL
         start = time.time()
         gmodel = genai.GenerativeModel(model)
@@ -94,13 +175,17 @@ class GeminiProvider(LLMProvider):
         }
 
     def generate_provider_web(self, prompt: str, model: Optional[str] = None,
-                              dynamic_threshold: float = 0.6) -> Dict[str, Any]:
+                              dynamic_threshold: float = 0.0) -> Dict[str, Any]:
         """
-        Gemini built in grounded search for 1.5 models.
+        PROVIDER_WEB: Gemini 1.5 built-in grounded search (GoogleSearchRetrieval).
+
+        NOTE: We default dynamic_threshold to 0.0 so retrieval nearly always fires.
+        If you prefer stricter behavior, raise it (e.g., 0.3–0.6).
         """
         model = model or GEMINI_DEFAULT_MODEL
         start = time.time()
         gmodel = genai.GenerativeModel(model)
+
         tools = [{
             "google_search_retrieval": {
                 "dynamic_retrieval_config": {
@@ -109,12 +194,18 @@ class GeminiProvider(LLMProvider):
                 }
             }
         }]
+
         resp = gmodel.generate_content(prompt, tools=tools)
         latency_ms = int((time.time() - start) * 1000)
 
         text = self._extract_text(resp)
         tokens_in, tokens_out = self._extract_usage(resp)
         sources = self._extract_grounded_sources(resp, text)
+
+        # Helpful debug when nothing comes back grounded
+        if not sources:
+            print("[gemini] provider_web returned no grounding/citations; likely internal-knowledge path chosen by dynamic retrieval.",
+                  file=sys.stderr)
 
         return {
             "text": text,
