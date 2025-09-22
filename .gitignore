@@ -14,3 +14,5 @@ venv/
 *.db
 *.sqlite
 .cache/
+secrets/*.json
+.streamlit/secrets.toml
