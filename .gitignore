@@ -12,6 +12,7 @@ venv/
 
 # Local databases and caches
 *.db
+!data/*.db
 *.sqlite
 .cache/
 secrets/*.json
