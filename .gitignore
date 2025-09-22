@@ -1,0 +1,16 @@
+# macOS
+.DS_Store
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Local config
+.env
+.streamlit/secrets.toml
+
+# Local databases and caches
+*.db
+*.sqlite
+.cache/
