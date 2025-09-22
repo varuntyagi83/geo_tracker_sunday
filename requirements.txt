@@ -16,3 +16,5 @@ plotly>=5,<6
 
 # Compatibility: Gemini stack needs protobuf < 5; Streamlit is OK with it.
 protobuf==4.25.3
+gspread>=6,<7
+gspread-dataframe>=3,<4
